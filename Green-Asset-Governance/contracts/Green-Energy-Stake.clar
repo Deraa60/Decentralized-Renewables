@@ -8,6 +8,7 @@
 (define-constant share-precision-factor u1000000) ;; 6 decimal places
 (define-constant proposal-approval-threshold u75) ;; 75% threshold for proposals
 (define-constant maintenance-block-window u144) ;; ~24 hours in blocks
+(define-constant max-asset-id u1000000) ;; Maximum asset ID for validation
 
 ;; Error Codes
 (define-constant ERR-UNAUTHORIZED-ACCESS (err u401))
@@ -27,6 +28,10 @@
 (define-constant ERR-ALREADY-CAST-VOTE (err u415))
 (define-constant ERR-INVALID-ASSET-STATUS (err u416))
 (define-constant ERR-QUORUM-NOT-REACHED (err u417))
+(define-constant ERR-INVALID-ASSET-ID (err u418))
+(define-constant ERR-INVALID-PROPOSAL-CATEGORY (err u419))
+(define-constant ERR-INVALID-PROPOSAL-DETAILS (err u420))
+(define-constant ERR-INVALID-REQUESTED-FUNDS (err u421))
 
 ;; Data Types
 (define-trait asset-ownership-trait
@@ -139,6 +144,25 @@
 (define-private (calculate-shareholder-voting-power (share-count uint) (total-shares uint))
     (/ (* share-count share-precision-factor) total-shares))
 
+(define-private (validate-asset-id (asset-id uint))
+    (and
+        (> asset-id u0)
+        (<= asset-id (var-get next-asset-id))
+        (<= asset-id max-asset-id)
+        (is-some (map-get? renewable-assets { asset-id: asset-id }))))
+
+(define-private (validate-proposal-category (category (string-ascii 20)))
+    (let ((category-len (len category)))
+        (and 
+            (> category-len u0)
+            (<= category-len u20))))
+
+(define-private (validate-proposal-details (details (string-ascii 500)))
+    (let ((details-len (len details)))
+        (and 
+            (> details-len u0)
+            (<= details-len u500))))
+
 ;; Public Functions - Asset Management
 
 (define-public (register-renewable-asset 
@@ -198,10 +222,14 @@
 
 ;; Enhanced Share Purchase
 (define-public (purchase-asset-shares (asset-id uint) (requested-share-count uint))
-    (let ((asset-record (unwrap! (map-get? renewable-assets { asset-id: asset-id })
+    (begin
+        ;; Validate asset ID first
+        (asserts! (validate-asset-id asset-id) ERR-INVALID-ASSET-ID)
+        
+        (let ((asset-record (unwrap! (map-get? renewable-assets { asset-id: asset-id })
                           ERR-ASSET-NOT-FOUND))
-          (investor-record (default-to 
-                                { 
+              (investor-record (default-to 
+                                {
                                     share-balance: u0, 
                                     claimed-revenue-amount: u0,
                                     last-claim-block-height: block-height,
@@ -209,54 +237,58 @@
                                 }
                                 (map-get? shareholder-registry 
                                     { asset-id: asset-id, shareholder: tx-sender }))))
-        (asserts! (> requested-share-count u0) ERR-ZERO-SHARE-QUANTITY)
-        (asserts! (<= requested-share-count (get remaining-shares asset-record)) 
-                 ERR-INSUFFICIENT-SHARE-BALANCE)
-        (asserts! (is-eq (get operational-status asset-record) "active") ERR-INVALID-ASSET-STATUS)
+            (asserts! (> requested-share-count u0) ERR-ZERO-SHARE-QUANTITY)
+            (asserts! (<= requested-share-count (get remaining-shares asset-record)) 
+                     ERR-INSUFFICIENT-SHARE-BALANCE)
+            (asserts! (is-eq (get operational-status asset-record) "active") ERR-INVALID-ASSET-STATUS)
 
-        (let ((total-purchase-cost (* requested-share-count (get share-price-in-stx asset-record)))
-              (updated-voting-power (calculate-shareholder-voting-power 
-                                (+ requested-share-count (get share-balance investor-record))
-                                (get total-share-count asset-record))))
-            (begin
-                (try! (stx-transfer? total-purchase-cost tx-sender (as-contract tx-sender)))
-                (map-set renewable-assets
-                    { asset-id: asset-id }
-                    (merge asset-record {
-                        remaining-shares: (- (get remaining-shares asset-record) 
-                                           requested-share-count),
-                        last-update-block-height: block-height
-                    }))
-                (map-set shareholder-registry
-                    { asset-id: asset-id, shareholder: tx-sender }
-                    {
-                        share-balance: (+ (get share-balance investor-record) requested-share-count),
-                        claimed-revenue-amount: (get claimed-revenue-amount investor-record),
-                        last-claim-block-height: (get last-claim-block-height investor-record),
-                        governance-voting-power: updated-voting-power
-                    })
-                (ok true)))))
+            (let ((total-purchase-cost (* requested-share-count (get share-price-in-stx asset-record)))
+                  (updated-voting-power (calculate-shareholder-voting-power 
+                                    (+ requested-share-count (get share-balance investor-record))
+                                    (get total-share-count asset-record))))
+                (begin
+                    (try! (stx-transfer? total-purchase-cost tx-sender (as-contract tx-sender)))
+                    (map-set renewable-assets
+                        { asset-id: asset-id }
+                        (merge asset-record {
+                            remaining-shares: (- (get remaining-shares asset-record) 
+                                              requested-share-count),
+                            last-update-block-height: block-height
+                        }))
+                    (map-set shareholder-registry
+                        { asset-id: asset-id, shareholder: tx-sender }
+                        {
+                            share-balance: (+ (get share-balance investor-record) requested-share-count),
+                            claimed-revenue-amount: (get claimed-revenue-amount investor-record),
+                            last-claim-block-height: (get last-claim-block-height investor-record),
+                            governance-voting-power: updated-voting-power
+                        })
+                    (ok true))))))
 
 ;; Revenue Management
 (define-public (distribute-asset-revenue (asset-id uint) (revenue-amount uint))
-    (let ((asset-record (unwrap! (map-get? renewable-assets { asset-id: asset-id })
+    (begin
+        ;; Validate asset ID first
+        (asserts! (validate-asset-id asset-id) ERR-INVALID-ASSET-ID)
+        
+        (let ((asset-record (unwrap! (map-get? renewable-assets { asset-id: asset-id })
                           ERR-ASSET-NOT-FOUND)))
-        (begin
-            (asserts! (is-eq tx-sender contract-owner) ERR-UNAUTHORIZED-ACCESS)
-            (asserts! (> revenue-amount u0) ERR-INVALID-INVESTMENT-AMOUNT)
-            (try! (stx-transfer? revenue-amount tx-sender (as-contract tx-sender)))
+            (begin
+                (asserts! (is-eq tx-sender contract-owner) ERR-UNAUTHORIZED-ACCESS)
+                (asserts! (> revenue-amount u0) ERR-INVALID-INVESTMENT-AMOUNT)
+                (try! (stx-transfer? revenue-amount tx-sender (as-contract tx-sender)))
 
-            (let ((updated-total-revenue (+ (get cumulative-revenue asset-record) revenue-amount))
-                  (updated-per-share-revenue (/ updated-total-revenue 
-                                          (get total-share-count asset-record))))
-                (map-set renewable-assets
-                    { asset-id: asset-id }
-                    (merge asset-record {
-                        cumulative-revenue: updated-total-revenue,
-                        revenue-per-share-unit: updated-per-share-revenue,
-                        last-update-block-height: block-height
-                    }))
-                (ok true)))))
+                (let ((updated-total-revenue (+ (get cumulative-revenue asset-record) revenue-amount))
+                      (updated-per-share-revenue (/ updated-total-revenue 
+                                              (get total-share-count asset-record))))
+                    (map-set renewable-assets
+                        { asset-id: asset-id }
+                        (merge asset-record {
+                            cumulative-revenue: updated-total-revenue,
+                            revenue-per-share-unit: updated-per-share-revenue,
+                            last-update-block-height: block-height
+                        }))
+                    (ok true))))))
 
 ;; Governance Functions
 (define-public (create-governance-proposal 
@@ -264,49 +296,66 @@
     (proposal-category (string-ascii 20))
     (proposal-details (string-ascii 500))
     (requested-funds uint))
-    (let ((new-proposal-id (+ (var-get next-proposal-id) u1))
-          (governance-settings (unwrap! (map-get? governance-rules { asset-id: asset-id })
-                            ERR-ASSET-NOT-FOUND))
-          (shareholder-record (unwrap! (map-get? shareholder-registry 
-                                    { asset-id: asset-id, shareholder: tx-sender })
-                                  ERR-UNAUTHORIZED-ACCESS)))
-        (begin
-            (asserts! (>= (get governance-voting-power shareholder-record) 
-                         (/ share-precision-factor u20)) ;; 5% minimum
-                     ERR-INSUFFICIENT-SHARE-BALANCE)
+    (begin
+        ;; Validate all inputs first
+        (asserts! (validate-asset-id asset-id) ERR-INVALID-ASSET-ID)
+        (asserts! (validate-proposal-category proposal-category) ERR-INVALID-PROPOSAL-CATEGORY)
+        (asserts! (validate-proposal-details proposal-details) ERR-INVALID-PROPOSAL-DETAILS)
+        (asserts! (or (is-eq requested-funds u0) (> requested-funds u0)) ERR-INVALID-REQUESTED-FUNDS)
+        
+        (let ((new-proposal-id (+ (var-get next-proposal-id) u1))
+              (governance-settings (unwrap! (map-get? governance-rules { asset-id: asset-id })
+                                ERR-ASSET-NOT-FOUND))
+              (shareholder-record (unwrap! (map-get? shareholder-registry 
+                                        { asset-id: asset-id, shareholder: tx-sender })
+                                      ERR-UNAUTHORIZED-ACCESS)))
+            (begin
+                (asserts! (>= (get governance-voting-power shareholder-record) 
+                             (/ share-precision-factor u20)) ;; 5% minimum
+                         ERR-INSUFFICIENT-SHARE-BALANCE)
 
-            (map-set asset-proposals
-                { asset-id: asset-id, proposal-id: new-proposal-id }
-                {
-                    proposal-creator: tx-sender,
-                    proposal-category: proposal-category,
-                    proposal-details: proposal-details,
-                    requested-funds: requested-funds,
-                    approval-vote-count: u0,
-                    rejection-vote-count: u0,
-                    proposal-status: "active",
-                    submission-block-height: block-height,
-                    voting-end-block-height: (+ block-height (get voting-period-duration governance-settings)),
-                    implementation-delay-blocks: (get execution-cooldown-blocks governance-settings),
-                    quorum-requirement-met: false
-                })
-            (var-set next-proposal-id new-proposal-id)
-            (ok new-proposal-id))))
+                (map-set asset-proposals
+                    { asset-id: asset-id, proposal-id: new-proposal-id }
+                    {
+                        proposal-creator: tx-sender,
+                        proposal-category: proposal-category,
+                        proposal-details: proposal-details,
+                        requested-funds: requested-funds,
+                        approval-vote-count: u0,
+                        rejection-vote-count: u0,
+                        proposal-status: "active",
+                        submission-block-height: block-height,
+                        voting-end-block-height: (+ block-height (get voting-period-duration governance-settings)),
+                        implementation-delay-blocks: (get execution-cooldown-blocks governance-settings),
+                        quorum-requirement-met: false
+                    })
+                (var-set next-proposal-id new-proposal-id)
+                (ok new-proposal-id)))))
 
 ;; Read-only Functions
 (define-read-only (get-asset-details (asset-id uint))
-    (map-get? renewable-assets { asset-id: asset-id }))
+    (if (validate-asset-id asset-id)
+        (map-get? renewable-assets { asset-id: asset-id })
+        none))
 
 (define-read-only (get-shareholder-details (asset-id uint) (shareholder principal))
-    (map-get? shareholder-registry { asset-id: asset-id, shareholder: shareholder }))
+    (if (validate-asset-id asset-id)
+        (map-get? shareholder-registry { asset-id: asset-id, shareholder: shareholder })
+        none))
 
 (define-read-only (get-asset-performance-metrics (asset-id uint))
-    (map-get? performance-metrics { asset-id: asset-id }))
+    (if (validate-asset-id asset-id)
+        (map-get? performance-metrics { asset-id: asset-id })
+        none))
 
 (define-read-only (get-asset-governance-rules (asset-id uint))
-    (map-get? governance-rules { asset-id: asset-id }))
+    (if (validate-asset-id asset-id)
+        (map-get? governance-rules { asset-id: asset-id })
+        none))
 
 (define-read-only (get-proposal-details 
     (asset-id uint)
     (proposal-id uint))
-    (map-get? asset-proposals { asset-id: asset-id, proposal-id: proposal-id }))
+    (if (validate-asset-id asset-id)
+        (map-get? asset-proposals { asset-id: asset-id, proposal-id: proposal-id })
+        none))
